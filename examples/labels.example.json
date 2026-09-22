@@ -1,0 +1,20 @@
+{
+  "synthetic": false,
+  "video_ids": ["REPLACE_WITH_VIDEO_CONTENT_HASH"],
+  "annotation_notes": "Template only. Replace with manually reviewed intervals; do not evaluate as-is.",
+  "queries": [
+    {
+      "id": "cuff-application",
+      "query": "Find moments where someone is being handcuffed",
+      "split": "test",
+      "iou_threshold": 0.5,
+      "matches": [{"video_id": "REPLACE_WITH_VIDEO_CONTENT_HASH", "start": 120.0, "end": 126.5}]
+    },
+    {
+      "id": "reviewed-absence",
+      "query": "REPLACE_WITH_QUERY_REVIEWED_TO_HAVE_NO_MATCHES",
+      "split": "test",
+      "matches": []
+    }
+  ]
+}

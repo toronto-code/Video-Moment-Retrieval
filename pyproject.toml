@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-moment-retrieval"
+version = "0.1.0"
+description = "Evidence-grounded multimodal video moment retrieval"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+speech = ["webrtcvad-wheels>=2.0.14,<3"]
+alignment = ["whisperx>=3.3,<4", "webrtcvad-wheels>=2.0.14,<3"]
+
+[project.scripts]
+video-moment-retrieval = "video_moment_retrieval.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["video_moment_retrieval*"]

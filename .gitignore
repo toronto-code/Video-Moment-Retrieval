@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.egg-info/
+.coverage
+data/
+reports/
+*.sqlite*
+*.mp4
+*.mov
+*.wav
+*.webm
+.DS_Store
