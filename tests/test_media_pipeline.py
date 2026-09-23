@@ -94,6 +94,39 @@ class MediaPipelineTests(unittest.TestCase):
         self.assertEqual((self.backend.extract_calls, self.backend.transcribe_calls), (1, 1))
         self.assertEqual(len(self.store.records()), count)
 
+    def test_chunk_words_use_original_timeline_in_storage_and_local_timeline_for_visuals(self):
+        seen = []
+        def extract(path, duration, transcript, context=None):
+            seen.append(transcript)
+            return {"summary": "speech", "observations": []}
+        segments = [{"start": "0.1", "end": "0.7", "text": "spoken word", "speaker": "A",
+                     "words": [{"word": "spoken", "start": "0.2", "end": "0.6", "speaker": "A"}]}]
+        with patch.object(self.backend, "transcribe", return_value=segments) as transcribe, \
+                patch.object(self.backend, "extract", side_effect=extract):
+            config = IndexConfig(window_seconds=2, overlap_seconds=.5, enable_ocr=False)
+            for _ in range(2):  # Cache hits must not apply the offset twice.
+                report = self.indexer.index(str(self.video), config)
+                self.assertEqual(report["errors"], [])
+                speech = sorted((r for r in self.store.records() if r.kind == "speech"), key=lambda r: r.start)
+                self.assertAlmostEqual(speech[1].start, 2.1)
+                self.assertAlmostEqual(speech[1].metadata["words"][0]["start"], 2.2)
+                self.assertAlmostEqual(speech[1].metadata["words"][0]["end"], 2.6)
+                self.assertEqual(speech[1].metadata["words"][0]["speaker"], speech[1].speaker)
+            self.assertEqual(transcribe.call_count, 2)
+        self.assertAlmostEqual(seen[1][0]["words"][0]["start"], .7)
+        self.assertAlmostEqual(seen[1][0]["words"][0]["end"], 1.1)
+
+    def test_sidecar_string_times_and_words_are_clipped_to_indexed_range(self):
+        sidecar = self.root/"transcript.json"
+        sidecar.write_text(json.dumps([{"start": "0.1", "end": "2", "text": "one two",
+            "words": [{"word": "one", "start": ".2", "end": ".9"},
+                      {"word": "two", "start": "1.5", "end": "2"}]}]))
+        report = self.indexer.index(str(self.video), IndexConfig(max_seconds=1, enable_ocr=False), str(sidecar))
+        self.assertEqual(report["errors"], [])
+        speech = next(r for r in self.store.records() if r.kind == "speech")
+        self.assertEqual(speech.end, 1)
+        self.assertEqual(speech.metadata["words"], [{"word": "one", "start": .2, "end": .9}])
+
     def test_failed_visual_stage_is_reported_and_retry_recovers(self):
         cfg = IndexConfig(window_seconds=3, overlap_seconds=0, enable_ocr=False)
         with patch.object(self.backend, "extract", side_effect=RuntimeError("transient")):

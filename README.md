@@ -57,7 +57,7 @@ An index invocation replaces that video's searchable snapshot with the requested
 
 ### Download script
 
-The downloader parses the company's script as data and never executes it. Signed URLs are not printed or stored in the index:
+The downloader parses the company's script as data and never executes it. Duplicate output filenames (including case collisions) are rejected. Downloads are checked against the response length when supplied and probed for a video stream before publication. Existing files are reused only when a saved transfer receipt matches the source and the file's size and SHA-256; files without receipts are downloaded again. Signed URLs are not printed or stored in the index or receipt:
 
 ```bash
 python3 -m video_moment_retrieval download /path/to/download-videos.sh --list
@@ -135,7 +135,7 @@ python3 -m video_moment_retrieval --data-dir data/test evaluate reviewed-labels.
   --candidate-budget 10 --split test --output reports/held-out.json
 ```
 
-The harness compares seven configurations: lexical, dense, structured, combined, combined+verification, combined+assessment, and combined+assessment+verification. The same post-merge candidate cap is used, and assessment and media verification are toggled separately. It reports candidate recall, final precision/recall, false positives/negatives, abstention, correct no-match decisions, onset/end errors, latency, and provider-reported cost. Empty answers do not receive perfect precision. Candidate recall measures whether any shortlisted interval contains at least 80% of each labeled event; a coverage window may retrieve several events. Final predictions use maximum-cardinality one-to-one interval matching so duplicates cannot inflate final recall. Labels may include `details`, such as a plate's exact text, which must match for a final true positive. Default acceptance is temporal IoU >= 0.5; onset queries can specify `onset_tolerance_seconds` instead.
+The harness compares seven configurations: lexical, dense, structured, combined, combined+verification, combined+assessment, and combined+assessment+verification. The same post-merge candidate cap is used, and assessment and media verification are toggled separately. It reports candidate recall, final precision/recall, false positives/negatives, abstention, correct no-match decisions, onset/end errors, latency, and provider-reported cost. Empty answers do not receive perfect precision. `candidate_temporal_recall` measures whether any shortlisted interval contains at least 80% of each labeled event; a coverage window may retrieve several events. `candidate_recall` additionally requires any labeled `details`, such as a plate's exact text, to match an indexed observation overlapping that event. Missing details receive no credit on this stricter metric; the temporal metric separately shows whether the correct footage reached verification. Details from different observations are never combined. Final predictions use maximum-cardinality one-to-one interval matching so duplicates cannot inflate final recall. Labels may include `details`, such as a plate's exact text, which must match for a final true positive. Default acceptance is temporal IoU >= 0.5; onset queries can specify `onset_tolerance_seconds` instead.
 
 Per-query cache hit/miss counts accompany latency and cost. Caching can make later runs warm; do not compare a cold policy against a warm one as a model-speed benchmark. Small-sample p95 values and synthetic scores should not be generalized.
 

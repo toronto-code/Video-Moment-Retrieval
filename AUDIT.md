@@ -25,6 +25,16 @@ Scope: the supplied **Video Moment Retrieval — Revised Architecture**, plus th
 | Original timeline preservation (§2.1/§2.2) | Demux could move delayed audio to the start of the extracted WAV | Explicit timestamp-based silence padding preserves initial delay and requested duration | Generated video with delayed audio retains leading silence after extraction |
 | Component replacement (§4/§2.9) | A single aggregate model identity invalidated unrelated stages | Stage-specific identities; changing an audio model preserves visual/assessment caches while invalidating audio-dependent work | Component-identity isolation test |
 
+## Follow-up review corrections
+
+- Preserve extractor speaker assignments through materialization, storage, and structured retrieval; require references to supplied transcript speakers.
+- Normalize numeric-string segment and word timestamps. Shift nested words with their ASR chunk, then clip and rebase both segments and words for visual-window excerpts. Cached segments are not mutated by rebasing.
+- Separate temporal candidate recall from detail-aware candidate recall; report both, including interval-scoped OCR readings in candidate evidence.
+- Read-only database opens no longer create parent directories. CLI help includes provider calls during live evaluation.
+- Reject duplicate download filenames. Validate response lengths and video streams before publishing, and verify saved SHA-256 transfer receipts before reusing files. Interrupted downloads preserve existing files.
+
+Existing indexes need reindexing to materialize corrected speaker and word metadata. Reindexing reuses valid extraction caches; transcript excerpts with corrected word times invalidate their dependent visual caches. These corrections do not constitute a live provider or real-accuracy benchmark.
+
 ## Intentional choices retained
 
 - Lexical search handles words; semantic embeddings handle paraphrases. The query planner does not fabricate vectors: the encoder supplies them.
