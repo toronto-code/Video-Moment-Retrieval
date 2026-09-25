@@ -48,7 +48,7 @@ Existing indexes need reindexing to materialize corrected speaker and word metad
 
 ## What is still not established
 
-1. **Real OpenRouter compatibility and accuracy:** no API key has been supplied. Text planning, VLM extraction, remote ASR, assessment, reconciliation, embeddings, and media verification have controlled-response contract tests, not a successful live end-to-end run.
+1. **Real OpenRouter compatibility and accuracy:** A key is now configured and loads locally; authenticated requests remain deliberately untested until the requested live test run. Text planning, VLM extraction, remote ASR, assessment, reconciliation, embeddings, and media verification have controlled-response contract tests, not a successful live end-to-end run.
 2. **WhisperX model behavior:** the optional adapter and integration are tested with controlled outputs. Its heavyweight dependencies/model weights have not been installed or run in this workspace; it may need a compatible Python/device environment and authorized speaker-model access.
 3. **Ground truth and empirical tuning:** no reviewed real-corpus labels have been supplied/created. Real precision, recall, localization error, latency, and API cost remain unmeasured. Configuration and retrieval-policy choices remain hypotheses.
 4. **Provider sampling:** `--fps` changes uploaded frames. It is not a guarantee of the provider's internal sampling rate. Adaptive/agentic provider routing has not been exercised. Claims about its quality or latency require live experiments, not an untested parameter.
@@ -67,3 +67,32 @@ python -m video_moment_retrieval --data-dir data/demo --demo evaluate \
 ```
 
 Real VAD smoke results are in the local ignored `reports/vad-smoke.json`. It ran on five-second audio samples from `video_18`, `video_26`, and `video_29`; this demonstrates execution on the actual recording format, not a measured VAD accuracy score.
+
+
+## Preflight check — 2026-09-24
+
+- The configured API key loads through the CLI and remains ignored by Git; its contents were not displayed. No authenticated requests or corpus inference were performed.
+- Local configuration selects `google/gemini-3.5-flash` for video, text, and audio and `openai/text-embedding-3-small` for embeddings. The [OpenRouter model page](https://openrouter.ai/google/gemini-3.5-flash) lists the required input modalities. Request formats were checked against the official video, audio, and embedding documentation; account access and live responses remain untested.
+- Fixed invalid index bounds (including NaN expanding a short test to a whole video), empty-index searches spending requests, empty completion responses, interrupted HTTP bodies, and missing/null usage reporting. Corrected the silence-transcription prompt to preserve its object schema.
+- Fixed local virtualenv activation paths after the project folder rename. The three downloaded MP4s have readable video/audio metadata. WhisperX is not installed; the configured default ASR uses OpenRouter.
+- All 83 automated tests pass with the optional speech dependency installed. Compilation and Git whitespace checks pass. The suite includes synthetic media integration and CLI demo/evaluation tests; those are not live model accuracy measurements.
+- Next step awaits the user's explicit live-test instructions. Authentication, credits, provider routing, response quality, timing, and cost can only be established during that run.
+
+
+## Correctness review fixes — 2026-09-24
+
+The seven follow-up findings now have regression coverage:
+
+1. Reindexing stages its full snapshot in a separate database. Failed extraction/embedding and interrupted runs preserve existing searchable data; publication is transactional and rolls back on write failure. Attempt reports remain inspectable independently of published coverage.
+2. Model-output validators check nested object/list types before accessing fields, producing explicit stage/verification failures instead of uncaught attribute errors.
+3. Search exposes operational errors and returns a failing CLI exit status for them. Evaluation excludes failed queries from aggregate correctness and does not count failures or abstentions as correct negative answers.
+4. Subject-binding evidence references are validated against actual supplied media, including nested references and required explanations.
+5. Visual subject continuity is separate from visual/speaker binding. Visual-only conjunctions do not acquire audio or speech requirements.
+6. Reconciliation coverage comes from scheduled neighboring-window tasks; failed neighbors leave skipped coverage.
+7. OCR verification requires a normalized box associated with a cited supplied frame inside the returned result interval. Shared validation applies to the provider adapter and cached/custom adapter outputs.
+
+Enumeration now freezes its retrieval queue once and enriches only the current page. A persisted index revision invalidates stale continuations. Its JSON queue/state still grows with job size; no claim of constant total job I/O is made.
+
+Ingestion now reserves bounded HTTP attempts across enabled stages sharing a client, including embeddings. Unused attempts roll forward without increasing the user's total cap; this does not guarantee that a small request budget can finish an entire video.
+
+No live API calls or corpus inference were performed for these fixes. Real manually reviewed evaluation remains part of the separately authorized live test.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from .types import Candidate, QueryPlan, component_identity
+from .types import Candidate, QueryPlan, component_identity, object_list, string_list
 
 
 def assess_candidates(assessor, cache, plan: QueryPlan, candidates: list[Candidate], batch_size: int = 10):
@@ -15,6 +15,10 @@ def assess_candidates(assessor, cache, plan: QueryPlan, candidates: list[Candida
         batch = candidates[offset:offset+batch_size]
         by_id = {c.record.id: c for c in batch}
         def validate(rows):
+            object_list(rows, "Assessments")
+            for row in rows:
+                string_list(row.get("evidence_ids", []), "Assessment evidence IDs")
+                string_list(row.get("supported_link_ids", []), "Assessment link IDs")
             if len(rows) != len(batch) or {r["record_id"] for r in rows} != set(by_id):
                 raise ValueError("Assessment must cover each candidate exactly once")
             for row in rows:
@@ -36,8 +40,8 @@ def assess_candidates(assessor, cache, plan: QueryPlan, candidates: list[Candida
                 lambda: assessor.assess(plan, batch), validate)
             for row in rows:
                 row = dict(row)
-                if plan.requires_subject_link and row["status"] == "likely" and not row.get("supported_link_ids"):
-                    row.update(status="unresolved", reason="Same-person binding lacks a supported speaker/person link")
+                if plan.requires_subject_link and row["status"] == "likely" and (plan.subject_link_kind == "visual" or not row.get("supported_link_ids")):
+                    row.update(status="unresolved", reason="Same-person binding requires direct media confirmation")
                 by_id[row["record_id"]].assessment = row
         except (RuntimeError, ValueError, KeyError, TypeError, OSError) as exc:
             errors.append(str(exc))

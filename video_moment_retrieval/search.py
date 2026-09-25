@@ -11,7 +11,7 @@ from .assessment import assess_candidates
 from .cache import ArtifactCache, atomic_json, digest
 from .retrieval import retrieve
 from .store import Store
-from .types import Candidate, Encoder, Planner, Verifier, Verdict, Verification, component_identity
+from .types import Candidate, Encoder, Planner, Verifier, Verdict, Verification, component_identity, validate_media_details
 
 
 @dataclass
@@ -102,6 +102,9 @@ class SearchEngine:
     def enrich(self, candidate: Candidate, config: SearchConfig) -> None:
         r = candidate.record
         start, end = bounds(candidate, config, self.store.video(r.video_id)["duration"])
+        if getattr(candidate, "_context_bounds", None) == (r.video_id, start, end):
+            return
+        candidate._context_bounds = (r.video_id, start, end)
         known = {rec.id for rec in candidate.records}
         candidate.members.extend(rec for rec in self.store.context(r.video_id, start, end)
                                  if rec.id not in known)
@@ -179,11 +182,8 @@ class SearchEngine:
                     "transcript": {"media:audio"} | {e["id"] for e in evidence if e["modality"] == "transcript"}}
                 if any(not cited.intersection(allowed[m]) for m in plan.modalities):
                     raise ValueError("Supported result lacks direct evidence for a required modality")
-                if plan.requires_subject_link:
-                    binding = verdict.details.get("subject_binding", {})
-                    if binding.get("method") != "visible_synchronized_speech" or not binding.get("person") or not binding.get("speaker") or \
-                            not {"media:audio", "media:visual"}.issubset(binding.get("evidence_ids", [])):
-                        raise ValueError("Same-person query requires an affirmative audiovisual subject binding")
+                validate_media_details(verdict, plan, ids,
+                    {f"media:frame:{i}": f["time"] for i, f in enumerate(prepared.get("frames", []))})
         # A cached answer cannot refer to removed/replaced derived files.
         for path in [prepared.get("clip"), prepared.get("audio"), *[f["path"] for f in prepared.get("frames", [])]]:
             if path and not Path(path).is_file():
@@ -192,62 +192,84 @@ class SearchEngine:
 
     def search(self, query: str, config: SearchConfig) -> dict:
         began = time.monotonic()
+        if not query.strip():
+            raise ValueError("Search query must not be empty")
+        if not self.store.db.execute("SELECT 1 FROM records LIMIT 1").fetchone():
+            raise ValueError("Index contains no searchable records; index a video before searching")
         plan = self.planner.plan(query)
-        if plan.requires_subject_link and "Same person satisfies the appearance and speech conditions" not in plan.criteria:
-            plan.criteria.append("Same person satisfies the appearance and speech conditions")
-        candidates, retrieval = retrieve(self.store, self.encoder, plan, config.candidate_budget,
-                                         config.policy, config.enumerate_all)
-        for candidate in candidates:
-            self.enrich(candidate, config)
-        assessment_errors = []
-        # Enumeration preserves stable deterministic order and assesses only this page.
-        if config.assess and self.assessor and not config.enumerate_all:
-            candidates, assessment_errors = assess_candidates(self.assessor, self.cache, plan, candidates)
-        elif config.assess and not self.assessor:
-            assessment_errors = ["No assessment adapter configured"]
-        tasks = verification_tasks(candidates, config)
+        if plan.requires_subject_link and plan.subject_criterion not in plan.criteria:
+            plan.criteria.append(plan.subject_criterion)
         sources = []
-        for video_id in sorted({c.record.video_id for c in candidates}):
-            video = self.store.video(video_id)
+        for row in self.store.db.execute("SELECT id FROM videos ORDER BY id"):
+            video = self.store.video(row[0])
             try:
-                state = self.source_state(video)
+                source_state = self.source_state(video)
             except (ValueError, OSError) as exc:
-                state = {"invalid": str(exc)}
-            sources.append([video_id, video["path"], state])
-        snapshot = digest({"version": 3, "plan": asdict(plan), "encoder": self.encoder.identity,
-            "sources": sources,
-            "candidates": [[r.to_dict() for r in c.records] for c in candidates],
-            "geometry": [config.max_clip_seconds, config.context_seconds, config.height, config.fps],
-            "mode": [config.verify, config.assess, config.enumerate_all, config.verify_budget, config.top_k],
+                source_state = {"invalid": str(exc)}
+            sources.append([video["id"], video["path"], source_state])
+        snapshot = digest({"version": 4, "revision": self.store.get_meta("index_revision"),
+            "plan": asdict(plan), "encoder": self.encoder.identity, "sources": sources,
+            "config": {k: v for k, v in asdict(config).items() if k not in {"snapshot", "offset"}},
+            "assessor": component_identity(self.assessor, "assessment"),
             "verifier": component_identity(self.verifier, "verification")})
         if config.snapshot and config.snapshot != snapshot:
             raise ValueError("Index, plan, or verification settings changed; restart enumeration")
-        state_path = self.cache.root / "enumeration" / (snapshot+".json")
-        state = {"next_offset": 0, "results": [], "incomplete_tasks": 0, "pages": {}}
+        state_path = self.cache.root / "enumeration" / (snapshot + ".json")
+        count = config.verify_budget if config.verify else config.top_k
+        assessment_errors = []
+        state = {"next_offset": 0, "results": [], "incomplete_tasks": 0, "operational_errors": [], "pages": {}}
+        candidates = []
         if config.enumerate_all and config.offset:
             if config.snapshot is None or not state_path.exists():
                 raise ValueError("Continuation requires previous snapshot and saved enumeration state")
             state = json.loads(state_path.read_text())
             if str(config.offset) in state["pages"]:
-                cached_page = state["pages"][str(config.offset)]
-                for inspected in cached_page["inspected"]:
+                cached = state["pages"][str(config.offset)]
+                for inspected in cached["inspected"]:
                     assets = inspected.get("inspection", {})
                     for path in [assets.get("clip"), assets.get("audio"), *[f["path"] for f in assets.get("frames", [])]]:
                         if path and not Path(path).is_file():
                             raise ValueError("Enumeration media was removed; restart from offset zero")
-                page_count = config.verify_budget if config.verify else config.top_k
-                return {"query": query, "plan": asdict(plan), "synthetic": self.synthetic,
-                    **cached_page, "retrieval": retrieval, "coverage": self.store.coverage(),
-                    "candidates": [candidate_summary(c) for c in tasks[config.offset:config.offset+page_count]],
-                    "accumulated_results": state["results"][:cached_page["pagination"]["accumulated_count"]],
-                    "completeness": "Enumeration covers indexed evidence in bounded slices; source sampling, failed ingestion, and missed detections still limit real-world recall."}
+                return {**cached, "coverage": self.store.coverage(),
+                        "accumulated_results": state["results"][:cached["pagination"]["accumulated_count"]]}
             if config.offset != state["next_offset"]:
                 raise ValueError("Enumeration offset would skip unexamined tasks")
-        count = config.verify_budget if config.verify else config.top_k
-        page = tasks[config.offset:config.offset+count]
-        if config.assess and self.assessor and config.enumerate_all:
-            # No reordering across pages; use assessment as evidence in each item's output.
-            _, assessment_errors = assess_candidates(self.assessor, self.cache, plan, page)
+            retrieval = state["retrieval"]
+        else:
+            candidates, retrieval = retrieve(self.store, self.encoder, plan, config.candidate_budget,
+                                             config.policy, config.enumerate_all)
+            if config.enumerate_all:
+                # Freeze a lightweight queue once. Continuations never rerun retrieval,
+                # enrich the corpus, or serialize all observations into a snapshot hash.
+                tasks = verification_tasks(candidates, config)
+                state.update(candidate_count=len(candidates), retrieval=retrieval, tasks=[
+                    {"record_id": c.record.id, "score": c.score, "channels": c.channels,
+                     "target_start": c.target_start, "target_end": c.target_end} for c in tasks])
+            else:
+                for candidate in candidates:
+                    self.enrich(candidate, config)
+                if config.assess and self.assessor:
+                    candidates, assessment_errors = assess_candidates(self.assessor, self.cache, plan, candidates)
+                elif config.assess:
+                    assessment_errors = ["No assessment adapter configured"]
+        if config.enumerate_all:
+            rows = state["tasks"][config.offset:config.offset + count]
+            records = {r.id: r for r in self.store.records([r["record_id"] for r in rows])}
+            page = [Candidate(records[r["record_id"]], r["score"], r["channels"],
+                              target_start=r["target_start"], target_end=r["target_end"]) for r in rows]
+            total_tasks, candidate_count = len(state["tasks"]), state["candidate_count"]
+            for candidate in page:
+                self.enrich(candidate, config)
+            if config.assess and self.assessor:
+                _, assessment_errors = assess_candidates(self.assessor, self.cache, plan, page)
+            elif config.assess:
+                assessment_errors = ["No assessment adapter configured"]
+        else:
+            page = candidates[config.offset:config.offset + count]
+            total_tasks = candidate_count = len(candidates)
+        errors = [*state["operational_errors"],
+            *[{"stage": "retrieval", "channel": k, "error": v} for k, v in retrieval.get("channel_errors", {}).items()],
+            *[{"stage": "assessment", "error": e} for e in assessment_errors]]
         inspected, found = [], []
         incomplete = 0
         for candidate in page:
@@ -262,7 +284,7 @@ class SearchEngine:
                 found.append({**base, "status": "candidate", "reason": "Not verified against media"})
                 continue
             try:
-                key = {"version": 2, "plan": asdict(plan), "source_state": self.source_state(video),
+                key = {"version": 3, "plan": asdict(plan), "source_state": self.source_state(video),
                     "records": [rec.to_dict() for rec in candidate.records],
                     "verifier": component_identity(self.verifier, "verification"),
                     "source": r.video_id, "target": [candidate.target_start, candidate.target_end],
@@ -273,7 +295,6 @@ class SearchEngine:
                         batch = Verification([Verdict("unresolved", prepared["unavailable"])], False)
                     else:
                         answer = self.verifier.verify(plan, candidate, prepared)
-                        # Legacy adapters are accepted for ranked search, but cannot assert exhaustive inspection.
                         batch = Verification([answer], not config.enumerate_all) if isinstance(answer, Verdict) else answer
                     return {"verification": batch.to_dict(), "inspection": prepared}
                 value = self.cache.get("verification", key, compute,
@@ -290,31 +311,38 @@ class SearchEngine:
                         found.append(item)
             except (RuntimeError, ValueError, KeyError, TypeError, OSError) as exc:
                 incomplete += 1
-                inspected.append({**base, "status": "unresolved", "reason": f"Verification failed: {exc}"})
+                error = {"stage": "verification", "record_id": r.id, "error": str(exc)}
+                errors.append(error)
+                inspected.append({**base, "status": "unresolved", "operational_error": error,
+                                  "reason": f"Verification failed: {exc}"})
         unique = []
         seen = state["results"] if config.enumerate_all else []
         for item in found:
             if not any(same_match(item, old) for old in [*seen, *unique]):
                 unique.append(item)
-        next_offset = config.offset+len(page)
+        next_offset = config.offset + len(page)
+        outcome = ("degraded" if found or seen else "failed") if errors else "complete"
+        decision = ("unavailable" if errors and not found else "candidates" if not config.verify
+                    else "matches" if found else "rejected_candidates" if inspected and not incomplete else "abstained")
         response = {"query": query, "plan": asdict(plan), "synthetic": self.synthetic,
             "results": unique if config.enumerate_all else unique[:config.top_k], "inspected": inspected,
             "candidates": [candidate_summary(c) for c in (page if config.enumerate_all else candidates)],
             "retrieval": retrieval, "assessment_errors": assessment_errors, "coverage": self.store.coverage(),
-            "pagination": {"offset": config.offset, "next_offset": next_offset if next_offset < len(tasks) else None,
-                "snapshot": snapshot, "candidate_count": len(candidates), "verification_task_count": len(tasks),
-                "candidate_set_exhausted": next_offset >= len(tasks),
-                "incomplete_tasks": state["incomplete_tasks"]+incomplete,
-                "all_tasks_verified": config.verify and next_offset >= len(tasks) and state["incomplete_tasks"]+incomplete == 0},
+            "operational_errors": errors, "outcome": outcome, "decision": decision,
+            "pagination": {"offset": config.offset, "next_offset": next_offset if next_offset < total_tasks else None,
+                "snapshot": snapshot, "candidate_count": candidate_count, "verification_task_count": total_tasks,
+                "candidate_set_exhausted": next_offset >= total_tasks,
+                "incomplete_tasks": state["incomplete_tasks"] + incomplete,
+                "all_tasks_verified": config.verify and not errors and next_offset >= total_tasks and state["incomplete_tasks"] + incomplete == 0},
             "completeness": "Enumeration covers indexed evidence in bounded slices; source sampling, failed ingestion, and missed detections still limit real-world recall.",
-            "elapsed_seconds": time.monotonic()-began}
+            "elapsed_seconds": time.monotonic() - began}
         if config.enumerate_all:
             state["results"].extend(unique)
             state["next_offset"] = next_offset
             state["incomplete_tasks"] += incomplete
+            state["operational_errors"] = errors
             response["accumulated_results"] = list(state["results"])
             response["pagination"]["accumulated_count"] = len(state["results"])
-            state["pages"][str(config.offset)] = {k: response[k] for k in
-                ("results", "inspected", "pagination", "elapsed_seconds", "assessment_errors")}
+            state["pages"][str(config.offset)] = {k: v for k, v in response.items() if k not in {"coverage", "accumulated_results"}}
             atomic_json(state_path, state)
         return response

@@ -3,17 +3,19 @@ from __future__ import annotations
 import json
 import math
 import time
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Callable
 
 from . import media
+from .budget import StageBudgets
 from .cache import ArtifactCache, atomic_json, digest, file_hash
 from .store import Store
 from .relationships import attach_reconciliation, attach_visual_links, rolling_context
 from .speech import attach_speakers, WebRTCSpeechDetector
-from .types import Encoder, Evidence, Extractor, OCR, Record, Transcriber, interval, component_identity
+from .types import Encoder, Evidence, Extractor, OCR, Record, Transcriber, interval, component_identity, object_value, object_list
 
 SCHEMA_VERSION = 2
 
@@ -30,11 +32,22 @@ class IndexConfig:
     rolling_context: bool = True
     reconcile_events: bool = True
 
+    def __post_init__(self):
+        if not all(math.isfinite(v) for v in (self.window_seconds, self.overlap_seconds, self.ocr_every_seconds)):
+            raise ValueError("Index intervals must be finite")
+        if self.window_seconds <= 0 or not 0 <= self.overlap_seconds < self.window_seconds or self.ocr_every_seconds <= 0:
+            raise ValueError("Invalid index window, overlap, or OCR interval")
+        if self.max_seconds is not None and (not math.isfinite(self.max_seconds) or self.max_seconds <= 0):
+            raise ValueError("max_seconds must be finite and positive")
+        if not 64 <= self.height <= 2160 or not 1 <= self.fps <= 60:
+            raise ValueError("Invalid media resolution/frame rate")
+
 
 def validate_segments(segments: list[dict], duration: float) -> None:
     """Validate and normalize timestamps, including optional aligned words, in place."""
     if not isinstance(segments, list):
         raise ValueError("Transcript must be a list")
+    object_list(segments, "Transcript segments")
     for segment in segments:
         segment["start"], segment["end"] = float(segment["start"]), float(segment["end"])
         interval(segment["start"], segment["end"], duration)
@@ -43,6 +56,7 @@ def validate_segments(segments: list[dict], duration: float) -> None:
         words = segment.get("words", [])
         if not isinstance(words, list):
             raise ValueError("Transcript words must be a list")
+        object_list(words, "Transcript words")
         for word in words:
             # Forced aligners may retain unaligned words without either timestamp.
             for key in ("start", "end"):
@@ -81,16 +95,20 @@ def transcript_slice(segments: list[dict], start: float, end: float, offset: flo
 
 
 def validate_extraction(data: dict, duration: float) -> None:
+    object_value(data, "Extraction")
     if not isinstance(data.get("summary"), str) or not data["summary"].strip():
         raise ValueError("Coverage window requires a nonempty summary")
     if not isinstance(data.get("observations"), list):
         raise ValueError("Missing observations list")
+    object_list(data["observations"], "Observations")
+    object_list(data.get("links", []), "Visual links")
     for obs in data["observations"]:
+        object_value(obs.get("attributes", {}), "Observation attributes")
         obs["start"], obs["end"] = float(obs["start"]), float(obs["end"])
         interval(obs["start"], obs["end"], duration)
         if obs["kind"] not in {"action", "appearance", "context", "audio"}:
             raise ValueError("Unsupported observation type")
-        if not obs.get("text", "").strip():
+        if not isinstance(obs.get("text"), str) or not obs["text"].strip():
             raise ValueError("Empty observation")
         if not all(isinstance(v, str) for v in obs.get("attributes", {}).values()):
             raise ValueError("Attributes must be strings")
@@ -120,6 +138,8 @@ def visual_records(data: dict, video_id: str, index: int, start: float, end: flo
 
 
 def validate_ocr(data: dict) -> None:
+    object_value(data, "OCR output")
+    object_list(data.get("detections"), "OCR detections")
     if not isinstance(data.get("detections"), list) or len(data["detections"]) > 20:
         raise ValueError("Invalid OCR detection list")
     for detection in data["detections"]:
@@ -176,12 +196,55 @@ class Indexer:
         self.reconciler = reconciler if reconciler is not None else (extractor if hasattr(extractor, "reconcile") else None)
 
     def index(self, path: str, config: IndexConfig, transcript_path: str | None = None) -> dict:
+        attempt_id = uuid.uuid4().hex
+        attempt_root = self.work.parent / "index-attempts"
+        attempt_root.mkdir(parents=True, exist_ok=True)
+        staging_path = attempt_root / (attempt_id + ".sqlite")
+        report_path = attempt_root / (attempt_id + ".json")
+        self.store.record_attempt(attempt_id, None, "running", str(report_path), str(staging_path))
+        staging = Store(staging_path)
+        worker = Indexer(staging, self.cache, self.work, self.extractor, self.transcriber, self.ocr,
+                         self.encoder, self.progress, self.speech_detector, self.reconciler)
+        try:
+            report = worker._index(path, config, transcript_path)
+            video_id = report["video_id"]
+            previous = self.store.db.execute("SELECT 1 FROM records WHERE video_id=? LIMIT 1", (video_id,)).fetchone()
+            publish = not report["errors"] or not previous
+            if publish:
+                self.store.publish_video(staging, video_id)
+            status = "published" if not report["errors"] else ("published_partial" if publish else "retained_previous")
+            report.update(publication=status, attempt_id=attempt_id, attempt_report=str(report_path),
+                          attempt_coverage=staging.coverage())
+            atomic_json(report_path, report)
+            self.store.record_attempt(attempt_id, video_id, status, str(report_path), str(staging_path))
+            return report
+        except BaseException as exc:
+            status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+            atomic_json(report_path, {"status": status, "error_type": type(exc).__name__, "coverage": staging.coverage()})
+            self.store.record_attempt(attempt_id, None, status, str(report_path), str(staging_path))
+            raise
+        finally:
+            if hasattr(worker, '_budgets'):
+                worker._budgets.restore()
+            staging.close()
+
+    def _index(self, path: str, config: IndexConfig, transcript_path: str | None = None) -> dict:
         started = time.monotonic()
         source = str(Path(path).resolve())
         info = media.probe(source)
         duration = info["duration"]
         stop = min(duration, config.max_seconds) if config.max_seconds is not None else duration
         spans = media.windows(stop, config.window_seconds, config.overlap_seconds)
+        stages = []
+        if info["has_audio"] and not transcript_path:
+            stages.append(("transcript", self.transcriber, 25))
+        stages.append(("visual", self.extractor, 35))
+        if config.reconcile_events and self.reconciler and len(spans) > 1:
+            stages.append(("reconciliation", self.reconciler, 5))
+        if config.enable_ocr:
+            stages.append(("ocr", self.ocr, 25))
+        stages.append(("embedding", self.encoder, 10))
+        self._budgets = StageBudgets(stages)
         if not math.isfinite(config.ocr_every_seconds) or config.ocr_every_seconds <= 0:
             raise ValueError("OCR interval must be finite and positive")
         video_id = file_hash(source)
@@ -212,7 +275,9 @@ class Indexer:
         for stage, tasks in scheduled.items():
             for a, b in tasks:
                 self.store.mark(video_id, stage, a, b, "pending")
-        self.store.mark(video_id, "reconciliation", 0, stop, "pending")
+        if config.reconcile_events and self.reconciler and len(spans) > 1:
+            for left, right in zip(spans, spans[1:]):
+                self.store.mark(video_id, "reconciliation", left[0], right[1], "pending")
         for a, b in spans:
             self.store.mark(video_id, "visual", a, b, "pending")
         transcript: list[dict] = []
@@ -222,6 +287,7 @@ class Indexer:
             transcript = transcript_slice(supplied, 0, stop)
             self.store.mark(video_id, "transcript", 0, stop, "complete", "user-supplied original-timeline alignment")
         elif info["has_audio"]:
+            self._budgets.enter("transcript")
             for a, b in asr_spans:
                 self.store.mark(video_id, "transcript", a, b, "pending")
                 self.progress(f"transcribe {a:.1f}–{b:.1f}s")
@@ -253,6 +319,7 @@ class Indexer:
                 speaker=s.get("speaker"), metadata={"alignment": "supplied" if transcript_path else getattr(self.transcriber, "alignment", "model_estimated"),
                                                    "words": s.get("words", [])}))
 
+        self._budgets.enter("visual")
         previous_context = None
         window_groups = []
         for i, (a, b) in enumerate(spans):
@@ -310,16 +377,16 @@ class Indexer:
             self.store.mark(video_id, "vad", 0, stop, "not_applicable", "no audio stream")
             self.store.mark(video_id, "audio", 0, stop, "not_applicable", "no audio stream")
 
-        if config.reconcile_events and self.reconciler and len(window_groups) > 1:
-            for left, right in zip(window_groups, window_groups[1:]):
-                # Compare actual neighboring windows, never bridge a failed extraction gap.
-                pair = [*left, *right]
-                a, b = left[0].start, right[0].end
-                self.store.mark(video_id, "reconciliation", a, b, "pending")
+        if config.reconcile_events and self.reconciler and len(spans) > 1:
+            self._budgets.enter("reconciliation")
+            groups = {group[0].start: group for group in window_groups}
+            for left_span, right_span in zip(spans, spans[1:]):
+                a, b = left_span[0], right_span[1]
+                if left_span[0] not in groups or right_span[0] not in groups:
+                    self.store.mark(video_id, "reconciliation", a, b, "skipped", "missing neighboring visual extraction")
+                    continue
+                pair = [*groups[left_span[0]], *groups[right_span[0]]]
                 try:
-                    if right[0].start > left[0].end:
-                        self.store.mark(video_id, "reconciliation", a, b, "skipped", "gap in visual evidence")
-                        continue
                     data = self.cache.get("reconciliation", {**identity, "model": component_identity(self.reconciler, "reconciliation"),
                         "records": [r.to_dict() for r in pair]}, lambda: self.reconciler.reconcile(pair),
                         lambda links: attach_reconciliation(deepcopy(pair), links))
@@ -327,14 +394,12 @@ class Indexer:
                     self.store.mark(video_id, "reconciliation", a, b, "complete", "evidence-linked hypotheses; no forced identity merge")
                 except (RuntimeError, ValueError, KeyError, TypeError, OSError) as exc:
                     failed("reconciliation", a, b, exc)
-            self.store.mark(video_id, "reconciliation", 0, stop,
-                "failed" if any(e["stage"] == "reconciliation" for e in errors) else "complete",
-                "pass finished; individual relationships remain hypotheses")
         else:
-            self.store.mark(video_id, "reconciliation", 0, stop, "not_applicable" if len(window_groups) <= 1 else "skipped",
+            self.store.mark(video_id, "reconciliation", 0, stop, "not_applicable" if len(spans) <= 1 else "skipped",
                             "one window or reconciliation disabled/unavailable")
 
         if config.enable_ocr:
+            self._budgets.enter("ocr")
             for i, (a, b) in enumerate(media.windows(stop, config.ocr_every_seconds, 0)):
                 self.store.mark(video_id, "ocr", a, b, "pending")
                 self.progress(f"OCR sample {a:.1f}–{b:.1f}s")
@@ -345,7 +410,7 @@ class Indexer:
                         times = sorted({max(a, min(b-0.01, a+delta)) for delta in (0.1, 0.5, 1.0)})
                         frames = [{"time": t, "path": media.frame(source, root / f"ocr-{t}.png", t)} for t in times]
                         # Detect on all nearby frames: whole-frame blur is not plate/crop blur.
-                        detections = self.ocr.read_frames(frames)
+                        detections = object_list(self.ocr.read_frames(frames), "OCR detections")
                         if len(detections) > 20:
                             raise ValueError("OCR detection count exceeds per-window budget")
                         for j, detection in enumerate(detections):
@@ -359,7 +424,7 @@ class Indexer:
                         detections.sort(key=lambda d: d["crop_sharpness"], reverse=True)
                         for detection in detections:
                             crop_path = detection["crop_path"]
-                            refined = self.ocr.read_crop(crop_path)
+                            refined = object_value(self.ocr.read_crop(crop_path), "OCR crop reading")
                             detection["coarse_reading"] = detection.get("text")
                             detection.update(refined)
                             detection["crop_path"] = crop_path
@@ -389,6 +454,7 @@ class Indexer:
         else:
             self.store.mark(video_id, "ocr", 0, stop, "skipped", "disabled by configuration")
 
+        self._budgets.enter("embedding")
         records = deduplicate_observations(records)
         atomic_json(root / "observations.json", [r.to_dict() for r in records])
         self.store.mark(video_id, "embedding", 0, stop, "pending")
@@ -403,6 +469,7 @@ class Indexer:
         report = {"video_id": video_id, "source": source, "duration_seconds": duration,
                   "requested_seconds": stop, "records": len(records), "errors": errors,
                   "config": asdict(config), "elapsed_seconds": time.monotonic()-started,
-                  "cache_hits": self.cache.hits, "cache_misses": self.cache.misses}
+                  "cache_hits": self.cache.hits, "cache_misses": self.cache.misses,
+                  "reserved_requests_by_stage": self._budgets.allocations}
         atomic_json(root / "index-report.json", report)
         return report

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import sqlite3
 from pathlib import Path
 
 from .cache import ArtifactCache, atomic_json
@@ -138,8 +139,8 @@ def main(argv: list[str] | None = None) -> int:
                         atomic_json(Path(args.output), result)
                 result["api_usage"] = client.stats() if client else {"http_attempts": 0, "synthetic": True}
         print(json.dumps(result, indent=2, allow_nan=False))
-        return 2 if result.get("errors") else 0
-    except (ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
+        return 2 if result.get("errors") or result.get("operational_errors") else 0
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError, sqlite3.Error) as exc:
         print(json.dumps({"error": str(exc), "type": type(exc).__name__}), file=sys.stderr)
         return 2
     except KeyboardInterrupt:

@@ -123,7 +123,12 @@ def evaluate(engine: SearchEngine, labels: dict, config: SearchConfig,
             after = client.stats() if client else before
             scores = metrics(response["candidates"], response["results"], q["matches"],
                              q.get("iou_threshold", 0.5), q.get("onset_tolerance_seconds"))
+            valid = not response.get("operational_errors")
+            if not valid or response.get("decision") == "abstained":
+                scores["no_match_correct"] = None
             results.append({"id": q["id"], "query": q["query"], **scores,
+                            "evaluation_valid": valid, "outcome": response.get("outcome", "complete"),
+                            "operational_errors": response.get("operational_errors", []),
                             "elapsed_seconds": response["elapsed_seconds"],
                             "http_attempts": after["http_attempts"]-before["http_attempts"],
                             "reported_cost_usd": after["reported_cost_usd"]-before["reported_cost_usd"],
@@ -134,13 +139,15 @@ def evaluate(engine: SearchEngine, labels: dict, config: SearchConfig,
                             "unresolved": sum(i["status"] == "unresolved" for i in response["inspected"]),
                             "result_intervals": [{k:r[k] for k in ("video_id", "start", "end", "status")}
                                                  for r in response["results"]]})
-        tp = sum(r["true_positives"] for r in results)
-        fp = sum(r["false_positives"] for r in results)
-        fn = sum(r["false_negatives"] for r in results)
-        recalls = [r["candidate_recall"] for r in results if r["candidate_recall"] is not None]
-        temporal_recalls = [r["candidate_temporal_recall"] for r in results if r["candidate_temporal_recall"] is not None]
+        valid_results = [r for r in results if r["evaluation_valid"]]
+        tp = sum(r["true_positives"] for r in valid_results)
+        fp = sum(r["false_positives"] for r in valid_results)
+        fn = sum(r["false_negatives"] for r in valid_results)
+        recalls = [r["candidate_recall"] for r in valid_results if r["candidate_recall"] is not None]
+        temporal_recalls = [r["candidate_temporal_recall"] for r in valid_results if r["candidate_temporal_recall"] is not None]
         latencies = sorted(r["elapsed_seconds"] for r in results)
         reports.append({"policy": policy, "candidate_budget": config.candidate_budget,
+                        "valid_query_count": len(valid_results), "failed_query_count": len(results)-len(valid_results),
                         "micro_precision": tp/(tp+fp) if tp+fp else None,
                         "micro_recall": tp/(tp+fn) if tp+fn else None,
                         "mean_candidate_recall": statistics.mean(recalls) if recalls else None,
@@ -152,4 +159,6 @@ def evaluate(engine: SearchEngine, labels: dict, config: SearchConfig,
     return {"synthetic": engine.synthetic, "split": split, "query_count": len(queries),
             "note": "Synthetic contract tests are not evidence of model accuracy." if engine.synthetic else
                     "Scores apply only to this manually reviewed subset. Report sample size and limitations.",
-            "policies": reports, "coverage": engine.store.coverage()}
+            "policies": reports, "coverage": engine.store.coverage(),
+            "operational_errors": [{"policy": p["policy"], "query_id": q["id"], **e}
+                for p in reports for q in p["queries"] for e in q["operational_errors"]]}

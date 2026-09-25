@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from .cache import digest
-from .types import Evidence, Record, interval
+from .types import Evidence, Record, interval, object_list, string_list
 
 
 def attach_visual_links(records: list[Record], proposals: list[dict], transcript: list[dict],
                         offset: float, duration: float, source: str, scope: str, has_audio: bool) -> None:
     known_people = {p for r in records for p in (r.subject, r.actor, r.recipient) if p}
     known_speakers = {s.get("speaker") for s in transcript if s.get("speaker")}
+    object_list(proposals, "Visual links")
     for raw in proposals:
         a, b = float(raw["start"]), float(raw["end"])
         interval(a, b, duration)
@@ -39,21 +40,22 @@ def attach_visual_links(records: list[Record], proposals: list[dict], transcript
 
 
 def attach_reconciliation(records: list[Record], links: list[dict]) -> None:
+    object_list(links, "Reconciliation links")
     by_id = {r.id: r for r in records}
     for raw in links:
         if raw.get("kind") not in {"event_continuation", "same_person"}:
             raise ValueError("Unknown reconciliation relationship")
-        ids = raw.get("record_ids", [])
+        ids = string_list(raw.get("record_ids", []), "Reconciliation record IDs")
         if len(ids) != 2 or len(set(ids)) != 2 or not set(ids).issubset(by_id):
             raise ValueError("Reconciliation must reference two distinct existing observations")
         a, b = [by_id[id_] for id_ in ids]
         if a.video_id != b.video_id:
             raise ValueError("Reconciliation cannot cross videos")
         evidence = {e.id: e for r in (a, b) for e in r.evidence}
-        cited = raw.get("evidence_ids", [])
+        cited = string_list(raw.get("evidence_ids", []), "Reconciliation evidence IDs")
         if not cited or not set(cited).issubset(evidence):
             raise ValueError("Reconciliation lacks valid supporting evidence")
-        if not raw.get("reason", "").strip():
+        if not isinstance(raw.get("reason"), str) or not raw["reason"].strip():
             raise ValueError("Reconciliation requires a reason")
         target = b
         known = {e.id for e in target.evidence}

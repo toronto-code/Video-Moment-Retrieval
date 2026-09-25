@@ -4,6 +4,7 @@ import json
 import math
 import re
 import sqlite3
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -50,12 +51,16 @@ class Store:
           start REAL NOT NULL, end REAL NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL,
           PRIMARY KEY(video_id,stage,start,end));
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS index_attempts(
+          id TEXT PRIMARY KEY, video_id TEXT, status TEXT NOT NULL, report_path TEXT NOT NULL, staging_path TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS relationships(
           id TEXT PRIMARY KEY, video_id TEXT NOT NULL REFERENCES videos(id),
           kind TEXT NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
           status TEXT NOT NULL, payload TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS relationship_lookup ON relationships(video_id,kind,start,end);
         """)
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO meta VALUES('index_revision',?)", (uuid.uuid4().hex,))
 
     def close(self) -> None:
         self.db.close()
@@ -82,6 +87,7 @@ class Store:
               path=excluded.path, duration=excluded.duration, has_audio=excluded.has_audio,
               metadata=excluded.metadata""",
               (video_id, path, duration, has_audio, json.dumps(metadata or {})))
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES('index_revision',?)", (uuid.uuid4().hex,))
 
     def replace_records(self, video_id: str, records: list[Record], vectors: list[list[float]] | None,
                         encoder: str) -> None:
@@ -130,6 +136,33 @@ class Store:
                         (link.get("id", f"{record.id}:link:{j}"), video_id, link.get("kind", "unspecified"),
                          link["start"], link["end"], link["status"], json.dumps(link)))
             self.db.execute("INSERT OR REPLACE INTO meta VALUES('encoder',?)", (encoder,))
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES('index_revision',?)", (uuid.uuid4().hex,))
+
+    def record_attempt(self, id_: str, video_id: str | None, status: str, report: str, staging: str) -> None:
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO index_attempts VALUES(?,?,?,?,?)", (id_, video_id, status, report, staging))
+
+    def publish_video(self, staging: Store, video_id: str) -> None:
+        """Copy a validated staging snapshot in one transaction; readers see old or new."""
+        video = staging.db.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
+        encoder = staging.get_meta("encoder")
+        incoming = staging.db.execute("SELECT DISTINCT dimension FROM vectors").fetchall()
+        dimensions = {r[0] for r in incoming}
+        other = self.db.execute("SELECT DISTINCT encoder,dimension FROM vectors v JOIN records r ON r.id=v.record_id WHERE r.video_id!=?", (video_id,)).fetchall()
+        if any(r['encoder'] != encoder or (dimensions and r['dimension'] not in dimensions) for r in other):
+            raise ValueError("Encoder/dimension changed: rebuild the index in a new data directory")
+        with self.db:
+            self.db.execute("INSERT INTO videos VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET path=excluded.path,duration=excluded.duration,has_audio=excluded.has_audio,metadata=excluded.metadata", tuple(video))
+            self.db.execute("DELETE FROM lexical WHERE record_id IN (SELECT id FROM records WHERE video_id=?)", (video_id,))
+            for table in ('records', 'relationships', 'coverage'):
+                self.db.execute(f"DELETE FROM {table} WHERE video_id=?", (video_id,))
+            for table in ('records', 'lexical', 'facts', 'vectors', 'relationships', 'coverage'):
+                rows = staging.db.execute(f"SELECT * FROM {table}").fetchall()
+                if rows:
+                    placeholders = ','.join('?' for _ in rows[0])
+                    self.db.executemany(f"INSERT INTO {table} VALUES({placeholders})", [tuple(r) for r in rows])
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES('encoder',?)", (encoder,))
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES('index_revision',?)", (uuid.uuid4().hex,))
 
     def mark(self, video_id: str, stage: str, start: float, end: float, status: str, detail: str = "") -> None:
         interval(start, end, self.video(video_id)["duration"])
@@ -209,4 +242,7 @@ class Store:
                                  "duration_seconds": v["duration"],
                                  "statuses": sorted({r["status"] for r in rows if r["stage"] == stage})}
             videos.append({"video_id": v["id"], "path": v["path"], "stages": stages, "intervals": rows})
-        return {"videos": videos, "note": "Processing coverage is not semantic retrieval completeness."}
+        # Older databases can still be inspected without a write-side migration.
+        has_attempts = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='index_attempts'").fetchone()
+        attempts = [dict(r) for r in self.db.execute("SELECT * FROM index_attempts ORDER BY rowid DESC LIMIT 50")] if has_attempts else []
+        return {"videos": videos, "attempts": attempts, "note": "Processing coverage is not semantic retrieval completeness."}
