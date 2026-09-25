@@ -96,3 +96,23 @@ Enumeration now freezes its retrieval queue once and enriches only the current p
 Ingestion now reserves bounded HTTP attempts across enabled stages sharing a client, including embeddings. Unused attempts roll forward without increasing the user's total cap; this does not guarantee that a small request budget can finish an entire video.
 
 No live API calls or corpus inference were performed for these fixes. Real manually reviewed evaluation remains part of the separately authorized live test.
+
+
+## Independent review follow-up — 2026-09-25
+
+Confirmed and fixed the nine numbered findings:
+
+- OCR now samples nine frames in three clusters spread across each window, with a new cache identity. This reduces blind spots but does not make sparse OCR exhaustive; image input increases.
+- VAD output and cache hits are validated. VAD failures are contained and skip dependent energy analysis; energy failures preserve completed VAD coverage. Invalid energy output cannot publish partial proposals.
+- Download scripts with a dangling output flag produce a structured error.
+- Window generation preserves positive sub-microsecond intervals, exact final bounds, and forward progress.
+- Immutable attempt sidecars are selected through published video metadata atomically with the database snapshot, preserving reports on failed reindexing/publication.
+- SQLite channel errors join normal retrieval degradation; complete database unavailability still fails explicitly.
+- WebRTC VAD accepts either supported distribution name or an explicit module version, and reports unidentifiable installations cleanly.
+- JSON writes sync file contents before replacement and the parent directory afterward where supported.
+
+Also required snapshots for ranked pagination, made partial inspection prominent without rejecting valid localized matches, and added explicit column mapping/schema compatibility validation to snapshot publication. Unknown-speaker energy baselines remain an explicitly unresolved heuristic; speaker separation cannot be invented from missing labels.
+
+Regression checks exercise OCR timing/cache reuse, short windows, corrupted VAD cache, independent audio failures, report preservation, reordered/incompatible schemas, download parsing, package metadata, disk sync failure, retrieval degradation, pagination, and localized prefix matches. No live API calls or corpus inference were performed.
+
+Validation: all 119 automated tests pass, including 18 new regressions. Compilation passes. These controlled tests do not establish live provider accuracy.

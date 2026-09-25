@@ -87,7 +87,7 @@ class Store:
               path=excluded.path, duration=excluded.duration, has_audio=excluded.has_audio,
               metadata=excluded.metadata""",
               (video_id, path, duration, has_audio, json.dumps(metadata or {})))
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES('index_revision',?)", (uuid.uuid4().hex,))
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('index_revision',?)", (uuid.uuid4().hex,))
 
     def replace_records(self, video_id: str, records: list[Record], vectors: list[list[float]] | None,
                         encoder: str) -> None:
@@ -135,8 +135,8 @@ class Store:
                     self.db.execute("INSERT OR REPLACE INTO relationships VALUES(?,?,?,?,?,?,?)",
                         (link.get("id", f"{record.id}:link:{j}"), video_id, link.get("kind", "unspecified"),
                          link["start"], link["end"], link["status"], json.dumps(link)))
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES('encoder',?)", (encoder,))
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES('index_revision',?)", (uuid.uuid4().hex,))
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('encoder',?)", (encoder,))
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('index_revision',?)", (uuid.uuid4().hex,))
 
     def record_attempt(self, id_: str, video_id: str | None, status: str, report: str, staging: str) -> None:
         with self.db:
@@ -144,7 +144,18 @@ class Store:
 
     def publish_video(self, staging: Store, video_id: str) -> None:
         """Copy a validated staging snapshot in one transaction; readers see old or new."""
-        video = staging.db.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
+        tables = ("videos", "records", "lexical", "facts", "vectors", "relationships", "coverage", "meta")
+        columns = {}
+        for table in tables:
+            source_schema = staging.db.execute(f"PRAGMA table_info({table})").fetchall()
+            target_schema = self.db.execute(f"PRAGMA table_info({table})").fetchall()
+            signature = lambda rows: {r["name"]: (r["type"], r["notnull"], r["pk"]) for r in rows}
+            if not source_schema or signature(source_schema) != signature(target_schema):
+                raise ValueError(f"Incompatible staging/index schema for {table}; migrate or rebuild the index")
+            columns[table] = ','.join('"' + r["name"].replace('"', '""') + '"' for r in source_schema)
+        video = staging.db.execute("SELECT id,path,duration,has_audio,metadata FROM videos WHERE id=?", (video_id,)).fetchone()
+        if video is None:
+            raise ValueError("Staging snapshot does not contain the requested video")
         encoder = staging.get_meta("encoder")
         incoming = staging.db.execute("SELECT DISTINCT dimension FROM vectors").fetchall()
         dimensions = {r[0] for r in incoming}
@@ -152,17 +163,17 @@ class Store:
         if any(r['encoder'] != encoder or (dimensions and r['dimension'] not in dimensions) for r in other):
             raise ValueError("Encoder/dimension changed: rebuild the index in a new data directory")
         with self.db:
-            self.db.execute("INSERT INTO videos VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET path=excluded.path,duration=excluded.duration,has_audio=excluded.has_audio,metadata=excluded.metadata", tuple(video))
+            self.db.execute("INSERT INTO videos(id,path,duration,has_audio,metadata) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET path=excluded.path,duration=excluded.duration,has_audio=excluded.has_audio,metadata=excluded.metadata", tuple(video))
             self.db.execute("DELETE FROM lexical WHERE record_id IN (SELECT id FROM records WHERE video_id=?)", (video_id,))
             for table in ('records', 'relationships', 'coverage'):
                 self.db.execute(f"DELETE FROM {table} WHERE video_id=?", (video_id,))
             for table in ('records', 'lexical', 'facts', 'vectors', 'relationships', 'coverage'):
-                rows = staging.db.execute(f"SELECT * FROM {table}").fetchall()
+                rows = staging.db.execute(f"SELECT {columns[table]} FROM {table}").fetchall()
                 if rows:
                     placeholders = ','.join('?' for _ in rows[0])
-                    self.db.executemany(f"INSERT INTO {table} VALUES({placeholders})", [tuple(r) for r in rows])
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES('encoder',?)", (encoder,))
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES('index_revision',?)", (uuid.uuid4().hex,))
+                    self.db.executemany(f"INSERT INTO {table}({columns[table]}) VALUES({placeholders})", [tuple(r) for r in rows])
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('encoder',?)", (encoder,))
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('index_revision',?)", (uuid.uuid4().hex,))
 
     def mark(self, video_id: str, stage: str, start: float, end: float, status: str, detail: str = "") -> None:
         interval(start, end, self.video(video_id)["duration"])

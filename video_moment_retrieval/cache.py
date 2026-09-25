@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -27,7 +28,20 @@ def atomic_json(path: Path, value: Any) -> None:
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(value, f, allow_nan=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        # Persist the rename as well as the file contents on supporting filesystems.
+        if os.name == "posix":
+            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                try:
+                    os.fsync(directory)
+                except OSError as exc:
+                    if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                        raise
+            finally:
+                os.close(directory)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)

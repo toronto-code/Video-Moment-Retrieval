@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 from .store import Store
@@ -62,7 +63,7 @@ def retrieve(store: Store, encoder: Encoder, plan: QueryPlan, budget: int = 30,
         for name, future in futures.items():
             try:
                 channels[name] = future.result()
-            except (RuntimeError, ValueError, OSError) as exc:
+            except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
                 errors[name] = str(exc)
                 channels[name] = []
     if len(errors) == len(names):

@@ -44,10 +44,14 @@ def windows(duration: float, size: float, overlap: float) -> list[tuple[float, f
     start = 0.0
     while start < duration:
         end = min(start + size, duration)
-        result.append((round(start, 6), round(end, 6)))
+        # Preserve positive sub-microsecond intervals and the exact duration bound.
+        result.append((start, end))
         if end == duration:
             break
-        start += size - overlap
+        next_start = len(result) * (float(size) - overlap)
+        if next_start <= start:
+            raise ValueError("Window step is below timestamp precision")
+        start = next_start
     return result
 
 

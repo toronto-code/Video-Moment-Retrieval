@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import wave
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
 
 class WebRTCSpeechDetector:
@@ -15,7 +15,17 @@ class WebRTCSpeechDetector:
         except ImportError:
             raise RuntimeError("Install speech dependencies: python -m pip install '.[speech]'. No transcript-as-VAD fallback is used.") from None
         self.vad = webrtcvad.Vad(mode)
-        self.identity = f"webrtcvad:{version('webrtcvad-wheels')}:mode={mode}:20ms-v1"
+        for distribution in ("webrtcvad-wheels", "webrtcvad"):
+            try:
+                release = version(distribution)
+                break
+            except PackageNotFoundError:
+                continue
+        else:
+            release = getattr(webrtcvad, "__version__", None)
+            if not isinstance(release, str) or not release:
+                raise RuntimeError("Cannot determine WebRTC VAD version; reinstall the speech extra")
+        self.identity = f"webrtcvad:{release}:mode={mode}:20ms-v1"
 
     def detect(self, audio: str) -> list[dict]:
         with wave.open(audio, "rb") as wav:

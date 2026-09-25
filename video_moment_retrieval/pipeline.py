@@ -205,6 +205,7 @@ class Indexer:
         staging = Store(staging_path)
         worker = Indexer(staging, self.cache, self.work, self.extractor, self.transcriber, self.ocr,
                          self.encoder, self.progress, self.speech_detector, self.reconciler)
+        worker.report_root = attempt_root / attempt_id
         try:
             report = worker._index(path, config, transcript_path)
             video_id = report["video_id"]
@@ -250,9 +251,13 @@ class Indexer:
         video_id = file_hash(source)
         root = self.work / video_id
         root.mkdir(parents=True, exist_ok=True)
+        sidecars = getattr(self, "report_root", root)
+        sidecars.mkdir(parents=True, exist_ok=True)
+        artifacts = {"observations": str(sidecars / "observations.json"),
+                     "index_report": str(sidecars / "index-report.json")}
         stat = Path(source).stat()
         self.store.add_video(video_id, source, duration, info["has_audio"], {**info, "synthetic": False,
-            "source_size": stat.st_size, "source_mtime_ns": stat.st_mtime_ns})
+            "source_size": stat.st_size, "source_mtime_ns": stat.st_mtime_ns, "artifacts": artifacts})
         self.store.clear_coverage(video_id)
         records: list[Record] = []
         errors = []
@@ -346,33 +351,45 @@ class Indexer:
                 previous_context = None
 
         if info["has_audio"]:
-            self.store.mark(video_id, "audio", 0, stop, "pending")
             try:
-                def dsp():
-                    path = media.audio(source, root / "dsp.wav", 0, stop)
-                    detector = self.speech_detector or WebRTCSpeechDetector()
-                    regions = self.cache.get("vad", {**identity, "end": stop, "detector": detector.identity},
-                                             lambda: detector.detect(path))
+                path = media.audio(source, root / "dsp.wav", 0, stop)
+                detector = self.speech_detector or WebRTCSpeechDetector()
+                def validate_regions(regions):
+                    object_list(regions, "VAD regions")
                     for region in regions:
                         interval(region["start"], region["end"], stop)
-                    self.store.mark(video_id, "vad", 0, stop, "complete", detector.identity)
+                regions = self.cache.get("vad", {**identity, "end": stop, "detector": detector.identity},
+                                         lambda: detector.detect(path), validate_regions)
+                self.store.mark(video_id, "vad", 0, stop, "complete", detector.identity)
+            except (RuntimeError, ValueError, KeyError, TypeError, OSError) as exc:
+                failed("vad", 0, stop, exc)
+                self.store.mark(video_id, "audio", 0, stop, "skipped", "VAD unavailable")
+            else:
+                try:
                     speaker_regions = attach_speakers(regions, transcript)
-                    return self.cache.get("dsp", {**identity, "end": stop, "regions": speaker_regions,
-                        "algorithm": "independent-vad-local-dbfs-v2"}, lambda: media.energy_observations(path, speaker_regions))
-                # VAD and energy artifacts are independent of ASR success; transcript only supplies optional speakers.
-                changes = dsp()
-                for i, change in enumerate(changes):
-                    id_ = f"{video_id}:energy:{i}"
-                    a, b = change["start"], change["end"]
-                    records.append(Record(id_, video_id, "audio", a, b,
-                        "Speech-region energy increase; possible raised voice, not confirmed shouting",
-                        [Evidence(id_+":e", "audio", a, b, source, "measured PCM energy in dBFS")],
-                        speaker=change["speaker"], attributes={"behavior": "raised_voice_candidate"},
-                        metadata=change))
-                self.store.mark(video_id, "audio", 0, stop, "complete", "energy proposals inside independently detected speech")
-            except (RuntimeError, ValueError, OSError) as exc:
-                self.store.mark(video_id, "vad", 0, stop, "failed", str(exc))
-                failed("audio", 0, stop, exc)
+                    def validate_changes(changes):
+                        object_list(changes, "Energy observations")
+                        for change in changes:
+                            interval(change["start"], change["end"], stop)
+                            if change["speaker"] is not None and not isinstance(change["speaker"], str):
+                                raise ValueError("Energy speaker must be text or null")
+                    # VAD and energy are independent of ASR success; transcript supplies optional speakers.
+                    changes = self.cache.get("dsp", {**identity, "end": stop, "regions": speaker_regions,
+                        "algorithm": "independent-vad-local-dbfs-v2"},
+                        lambda: media.energy_observations(path, speaker_regions), validate_changes)
+                    energy_records = []
+                    for i, change in enumerate(changes):
+                        id_ = f"{video_id}:energy:{i}"
+                        a, b = change["start"], change["end"]
+                        energy_records.append(Record(id_, video_id, "audio", a, b,
+                            "Speech-region energy increase; possible raised voice, not confirmed shouting",
+                            [Evidence(id_+":e", "audio", a, b, source, "measured PCM energy in dBFS")],
+                            speaker=change["speaker"], attributes={"behavior": "raised_voice_candidate"},
+                            metadata=change))
+                    records.extend(energy_records)
+                    self.store.mark(video_id, "audio", 0, stop, "complete", "energy proposals inside independently detected speech")
+                except (RuntimeError, ValueError, KeyError, TypeError, OSError) as exc:
+                    failed("audio", 0, stop, exc)
         else:
             self.store.mark(video_id, "vad", 0, stop, "not_applicable", "no audio stream")
             self.store.mark(video_id, "audio", 0, stop, "not_applicable", "no audio stream")
@@ -407,7 +424,11 @@ class Indexer:
                     def read():
                         if hasattr(self.ocr, "ensure_budget"):
                             self.ocr.ensure_budget()
-                        times = sorted({max(a, min(b-0.01, a+delta)) for delta in (0.1, 0.5, 1.0)})
+                        # Three short clusters across the window improve temporal coverage
+                        # while retaining nearby alternatives for blur disambiguation.
+                        jitter = min(.2, (b-a)*.05)
+                        times = sorted({a+(b-a)*fraction+delta
+                            for fraction in (.2, .5, .8) for delta in (-jitter, 0, jitter)})
                         frames = [{"time": t, "path": media.frame(source, root / f"ocr-{t}.png", t)} for t in times]
                         # Detect on all nearby frames: whole-frame blur is not plate/crop blur.
                         detections = object_list(self.ocr.read_frames(frames), "OCR detections")
@@ -430,7 +451,7 @@ class Indexer:
                             detection["crop_path"] = crop_path
                         return {"frames": frames, "detections": detections}
                     data = self.cache.get("ocr", {**identity, "model": component_identity(self.ocr, "ocr"), "start": a,
-                        "end": b, "sampling": "three-nearby-crop-sharpness-v3"}, read, validate_ocr)
+                        "end": b, "sampling": "three-spread-clusters-crop-sharpness-v4"}, read, validate_ocr)
                     for j, detection in enumerate(data["detections"]):
                         f = data["frames"][detection["frame_index"]]
                         box = detection["bbox"]
@@ -456,7 +477,7 @@ class Indexer:
 
         self._budgets.enter("embedding")
         records = deduplicate_observations(records)
-        atomic_json(root / "observations.json", [r.to_dict() for r in records])
+        atomic_json(Path(artifacts["observations"]), [r.to_dict() for r in records])
         self.store.mark(video_id, "embedding", 0, stop, "pending")
         try:
             vectors = self.encoder.encode([r.text + " " + json.dumps(r.attributes, sort_keys=True) for r in records])
@@ -467,9 +488,9 @@ class Indexer:
             # Embedding failure must not discard successfully extracted lexical/structured evidence.
             self.store.replace_records(video_id, records, None, self.encoder.identity)
         report = {"video_id": video_id, "source": source, "duration_seconds": duration,
-                  "requested_seconds": stop, "records": len(records), "errors": errors,
+                  "requested_seconds": stop, "records": len(records), "errors": errors, "artifacts": artifacts,
                   "config": asdict(config), "elapsed_seconds": time.monotonic()-started,
                   "cache_hits": self.cache.hits, "cache_misses": self.cache.misses,
                   "reserved_requests_by_stage": self._budgets.allocations}
-        atomic_json(root / "index-report.json", report)
+        atomic_json(Path(artifacts["index_report"]), report)
         return report

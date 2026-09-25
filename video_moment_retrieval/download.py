@@ -24,7 +24,10 @@ def entries(path: str | Path) -> list[tuple[str, str]]:
         parts = shlex.split(line)
         if "-o" not in parts:
             continue
-        name = parts[parts.index("-o") + 1]
+        output_index = parts.index("-o") + 1
+        if output_index >= len(parts):
+            raise ValueError("Download entry is missing a filename after -o")
+        name = parts[output_index]
         urls = [p for p in parts if p.startswith("https://")]
         if not re.fullmatch(r"[\w.-]+\.(mp4|webm|mov)", name) or len(urls) != 1:
             raise ValueError("Unsafe filename or ambiguous download URL")

@@ -192,6 +192,8 @@ class SearchEngine:
 
     def search(self, query: str, config: SearchConfig) -> dict:
         began = time.monotonic()
+        if config.offset and config.snapshot is None:
+            raise ValueError("Pagination requires the previous snapshot; restart from offset zero")
         if not query.strip():
             raise ValueError("Search query must not be empty")
         if not self.store.db.execute("SELECT 1 FROM records LIMIT 1").fetchone():
@@ -207,7 +209,7 @@ class SearchEngine:
             except (ValueError, OSError) as exc:
                 source_state = {"invalid": str(exc)}
             sources.append([video["id"], video["path"], source_state])
-        snapshot = digest({"version": 4, "revision": self.store.get_meta("index_revision"),
+        snapshot = digest({"version": 5, "revision": self.store.get_meta("index_revision"),
             "plan": asdict(plan), "encoder": self.encoder.identity, "sources": sources,
             "config": {k: v for k, v in asdict(config).items() if k not in {"snapshot", "offset"}},
             "assessor": component_identity(self.assessor, "assessment"),
@@ -305,7 +307,9 @@ class SearchEngine:
                     incomplete += 1
                 for verdict in batch.verdicts:
                     item = {**base, **asdict(verdict), "inspection": prepared,
-                            "evidence": self.media_evidence(prepared, candidate), "inspection_complete": batch.complete}
+                            "evidence": self.media_evidence(prepared, candidate),
+                            "clip_inspection_complete": batch.complete,
+                            "inspection_complete": batch.complete and prepared["whole_candidate_inspected"]}
                     inspected.append(item)
                     if verdict.status == "supported":
                         found.append(item)
@@ -329,6 +333,7 @@ class SearchEngine:
             "candidates": [candidate_summary(c) for c in (page if config.enumerate_all else candidates)],
             "retrieval": retrieval, "assessment_errors": assessment_errors, "coverage": self.store.coverage(),
             "operational_errors": errors, "outcome": outcome, "decision": decision,
+            "partial_inspection": bool(config.verify and (incomplete or state["incomplete_tasks"] or (config.offset and not config.enumerate_all) or next_offset < total_tasks)),
             "pagination": {"offset": config.offset, "next_offset": next_offset if next_offset < total_tasks else None,
                 "snapshot": snapshot, "candidate_count": candidate_count, "verification_task_count": total_tasks,
                 "candidate_set_exhausted": next_offset >= total_tasks,

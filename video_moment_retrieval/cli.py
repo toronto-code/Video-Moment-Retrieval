@@ -54,7 +54,7 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("--all", action="store_true", dest="enumerate_all")
     search.add_argument("--offset", type=int, default=0, help="Candidate offset, not result offset")
-    search.add_argument("--snapshot", help="Snapshot from previous page; reject pagination across changed index")
+    search.add_argument("--snapshot", help="Required with --offset: snapshot from the previous page")
     search.add_argument("--unverified", action="store_true", help="Return candidates, never call them verified")
     search.add_argument("--verify-budget", type=int, default=5)
     search.add_argument("--top-k", type=int, default=5)
