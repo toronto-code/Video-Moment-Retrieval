@@ -12,6 +12,10 @@ from pathlib import Path
 
 from .types import interval
 
+# Every clip, frame, and crop derived from source video is downscaled to at most
+# this height and never upscaled. Source files themselves are never modified.
+MAX_HEIGHT = 720
+
 
 def run(args: list[str], timeout: float = 120) -> bytes:
     try:
@@ -57,8 +61,8 @@ def windows(duration: float, size: float, overlap: float) -> list[tuple[float, f
 
 def clip(source: str, target: Path, start: float, end: float, height: int = 720, fps: int = 8) -> str:
     interval(start, end)
-    if height < 64 or height > 2160 or fps < 1 or fps > 60:
-        raise ValueError("Invalid video encoding bounds")
+    if height < 64 or height > MAX_HEIGHT or fps < 1 or fps > 60:
+        raise ValueError(f"Invalid video encoding bounds; height is capped at {MAX_HEIGHT}")
     target.parent.mkdir(parents=True, exist_ok=True)
     run(["ffmpeg", "-v", "error", "-y", "-ss", str(start), "-i", source,
          "-t", str(end-start), "-map", "0:v:0", "-map", "0:a:0?",
@@ -76,10 +80,12 @@ def audio(source: str, target: Path, start: float, end: float) -> str:
     return str(target)
 
 
-def frame(source: str, target: Path, time: float) -> str:
+def frame(source: str, target: Path, time: float, height: int = MAX_HEIGHT) -> str:
+    if height < 64 or height > MAX_HEIGHT:
+        raise ValueError(f"Frame height must stay within 64–{MAX_HEIGHT}")
     target.parent.mkdir(parents=True, exist_ok=True)
     run(["ffmpeg", "-v", "error", "-y", "-ss", str(time), "-i", source,
-         "-frames:v", "1", "-update", "1", str(target)])
+         "-vf", f"scale=-2:'min({height},ih)'", "-frames:v", "1", "-update", "1", str(target)])
     if not target.exists() or not target.stat().st_size:
         raise RuntimeError("Frame extraction produced no image")
     return str(target)

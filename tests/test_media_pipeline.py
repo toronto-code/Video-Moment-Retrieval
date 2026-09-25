@@ -146,6 +146,19 @@ class MediaPipelineTests(unittest.TestCase):
         self.assertIsNone(ocr.metadata["text"])
         self.assertTrue(Path(ocr.evidence[0].source).exists())
 
+    def test_frames_are_downscaled_to_the_ceiling_and_never_upscaled(self):
+        tall = self.root / "tall.mp4"
+        media.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x1440:rate=10",
+                   "-t", "1", "-pix_fmt", "yuv420p", str(tall)])
+        def size(path):
+            info = json.loads(media.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", path]))
+            stream = next(s for s in info["streams"] if s["codec_type"] == "video")
+            return stream["width"], stream["height"]
+        self.assertEqual(size(media.frame(str(tall), self.root / "f720.png", .5, 720)), (160, 720))
+        self.assertEqual(size(media.frame(str(tall), self.root / "f360.png", .5, 360)), (80, 360))
+        # Sources already below the ceiling keep their original size.
+        self.assertEqual(size(media.frame(str(self.video), self.root / "small.png", .5)), (160, 120))
+
     def test_partial_index_reports_unprocessed_tail(self):
         result = self.indexer.index(str(self.video), IndexConfig(max_seconds=1, enable_ocr=False))
         stages = self.store.coverage()["videos"][0]["stages"]

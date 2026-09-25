@@ -242,7 +242,7 @@ Transcript is context only, not proof of visual actions: {json.dumps(transcript)
 
     def read_frames(self, frames: list[dict]) -> list[dict]:
         prompt = """Independently detect visible license plates and other readable text in these
-original-resolution frames. Return {"detections":[{"frame_index":0,"text":null,
+frames (downscaled to at most 720p; small text may be illegible). Return {"detections":[{"frame_index":0,"text":null,
 "text_type":"license_plate|sign|other","bbox":[left,top,right,bottom],
 "legibility":"readable|partial|unreadable","detail":"visible evidence"}]}.
 Coordinates are normalized 0..1. Detect unreadable plates too, with text=null. Preserve unknown
@@ -253,7 +253,7 @@ readings are separate observations, not forced consensus. Frame times: """ + jso
 
     def read_crop(self, path: str) -> dict:
         return self.client.chat(self.video_model,
-            'Read only the visible text in this original-resolution crop. Return '
+            'Read only the visible text in this crop taken from a frame downscaled to at most 720p. Return '
             '{"text":null,"legibility":"readable|partial|unreadable","detail":"visible support"}. '
             'Keep unknown characters as ?. Never invent or complete unreadable characters. '
             'If no characters can be read, use text=null and legibility=unreadable.',

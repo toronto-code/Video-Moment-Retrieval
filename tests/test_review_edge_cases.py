@@ -62,7 +62,7 @@ class PipelineReviewTests(unittest.TestCase):
         self.backend.read_frames = frames
         self.backend.read_crop = lambda path: {'text': 'LATE', 'legibility': 'readable'}
         self.config.enable_ocr = True
-        with patch.object(media, 'frame', side_effect=lambda source, target, time: str(target)), \
+        with patch.object(media, 'frame', side_effect=lambda source, target, time, height=720: str(target)), \
                 patch.object(media, 'crop', side_effect=crop), patch.object(media, 'sharpness', return_value=1):
             report = self.index()
             self.assertEqual(report['errors'], [])
@@ -77,11 +77,23 @@ class PipelineReviewTests(unittest.TestCase):
         seen = []
         self.backend.read_frames = lambda inputs: seen.append([f['time'] for f in inputs]) or []
         self.config.enable_ocr = True
-        with patch.object(media, 'frame', side_effect=lambda source, target, time: str(target)):
+        with patch.object(media, 'frame', side_effect=lambda source, target, time, height=720: str(target)):
             report = self.index()
         self.assertEqual(report['errors'], [])
         self.assertEqual(len(seen[-1]), 9)
         self.assertTrue(all(10 < t < 10.001 for t in seen[-1]))
+
+    def test_ocr_cache_is_bounded_by_frame_height(self):
+        calls = []
+        self.backend.read_frames = lambda inputs: calls.append(1) or []
+        self.config.enable_ocr = True
+        with patch.object(media, 'frame', side_effect=lambda source, target, time, height: str(target)):
+            self.assertEqual(self.index()['errors'], [])
+            self.index()
+            self.assertEqual(len(calls), 5)   # same height reuses OCR artifacts
+            self.config.height = 640
+            self.index()
+            self.assertEqual(len(calls), 10)  # a new frame height recomputes them
 
     def test_malformed_vad_becomes_failed_stage_without_aborting_index(self):
         self.info['has_audio'] = True
@@ -283,3 +295,20 @@ class RetrievalReviewTests(unittest.TestCase):
         self.assertFalse(result['results'][0]['inspection_complete'])
         self.assertTrue(result['results'][0]['clip_inspection_complete'])
         self.assertFalse(result['pagination']['all_tasks_verified'])
+
+
+class MediaCeilingTests(unittest.TestCase):
+    def test_heights_above_the_720_ceiling_are_rejected(self):
+        for bad in (721, 1080, 2160):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, '720'):
+                    IndexConfig(height=bad)
+                with self.assertRaisesRegex(ValueError, '720'):
+                    SearchConfig(height=bad)
+        self.assertEqual((IndexConfig().height, SearchConfig().height), (720, 720))
+
+    def test_media_helpers_reject_heights_above_the_ceiling(self):
+        with self.assertRaises(ValueError):
+            media.frame('source', Path('/tmp/frame.png'), 0, 721)
+        with self.assertRaises(ValueError):
+            media.clip('source', Path('/tmp/clip.mp4'), 0, 1, 1080)

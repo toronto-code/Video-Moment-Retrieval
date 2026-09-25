@@ -35,8 +35,10 @@ class SearchConfig:
             raise ValueError("Positive budgets and nonnegative offset required")
         if not 0 < self.max_clip_seconds <= 120 or not 0 <= self.context_seconds <= 30:
             raise ValueError("Invalid clip/context budget")
-        if not 64 <= self.height <= 2160 or not 1 <= self.fps <= 60:
-            raise ValueError("Invalid media resolution/frame rate")
+        if not 64 <= self.height <= media.MAX_HEIGHT:
+            raise ValueError(f"Height must stay within 64–{media.MAX_HEIGHT}; derived media never exceeds {media.MAX_HEIGHT}p")
+        if not 1 <= self.fps <= 60:
+            raise ValueError("Invalid frame rate")
 
 
 def bounds(candidate: Candidate, config: SearchConfig, duration: float) -> tuple[float, float]:
@@ -139,7 +141,7 @@ class SearchEngine:
             # Inspect known detections first. Also spread samples through the target,
             # rather than inspecting only its start as the initial implementation did.
             times = sorted(ocr_times)[:6] or [start+(end-start)*f for f in (.1,.5,.9)]
-            prepared["frames"] = [{"time": t, "path": media.frame(v["path"], root / f"frame-{t}.png", t)} for t in times]
+            prepared["frames"] = [{"time": t, "path": media.frame(v["path"], root / f"frame-{t}.png", t, config.height)} for t in times]
             prepared["sampled_visual_only"] = True
         return prepared
 
@@ -163,7 +165,7 @@ class SearchEngine:
         for i, frame in enumerate(prepared.get("frames", [])):
             evidence.append({"id": f"media:frame:{i}", "modality": "ocr", "start": frame["time"],
                 "end": min(prepared["end"], frame["time"]+.01), "source": frame["path"],
-                "detail": "Original-resolution verification frame"})
+                "detail": f"Verification frame downscaled to at most {media.MAX_HEIGHT}p"})
         return evidence
 
     def validate_verification(self, value: dict, plan, candidate: Candidate):
@@ -286,7 +288,9 @@ class SearchEngine:
                 found.append({**base, "status": "candidate", "reason": "Not verified against media"})
                 continue
             try:
-                key = {"version": 3, "plan": asdict(plan), "source_state": self.source_state(video),
+                # Version 4: verification frames are now downscaled to config height (720p ceiling),
+                # so verdicts derived from full-resolution frames must not be replayed.
+                key = {"version": 4, "plan": asdict(plan), "source_state": self.source_state(video),
                     "records": [rec.to_dict() for rec in candidate.records],
                     "verifier": component_identity(self.verifier, "verification"),
                     "source": r.video_id, "target": [candidate.target_start, candidate.target_end],

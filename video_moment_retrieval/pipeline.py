@@ -39,8 +39,10 @@ class IndexConfig:
             raise ValueError("Invalid index window, overlap, or OCR interval")
         if self.max_seconds is not None and (not math.isfinite(self.max_seconds) or self.max_seconds <= 0):
             raise ValueError("max_seconds must be finite and positive")
-        if not 64 <= self.height <= 2160 or not 1 <= self.fps <= 60:
-            raise ValueError("Invalid media resolution/frame rate")
+        if not 64 <= self.height <= media.MAX_HEIGHT:
+            raise ValueError(f"Height must stay within 64–{media.MAX_HEIGHT}; derived media never exceeds {media.MAX_HEIGHT}p")
+        if not 1 <= self.fps <= 60:
+            raise ValueError("Invalid frame rate")
 
 
 def validate_segments(segments: list[dict], duration: float) -> None:
@@ -429,7 +431,7 @@ class Indexer:
                         jitter = min(.2, (b-a)*.05)
                         times = sorted({a+(b-a)*fraction+delta
                             for fraction in (.2, .5, .8) for delta in (-jitter, 0, jitter)})
-                        frames = [{"time": t, "path": media.frame(source, root / f"ocr-{t}.png", t)} for t in times]
+                        frames = [{"time": t, "path": media.frame(source, root / f"ocr-{t}.png", t, config.height)} for t in times]
                         # Detect on all nearby frames: whole-frame blur is not plate/crop blur.
                         detections = object_list(self.ocr.read_frames(frames), "OCR detections")
                         if len(detections) > 20:
@@ -451,7 +453,8 @@ class Indexer:
                             detection["crop_path"] = crop_path
                         return {"frames": frames, "detections": detections}
                     data = self.cache.get("ocr", {**identity, "model": component_identity(self.ocr, "ocr"), "start": a,
-                        "end": b, "sampling": "three-spread-clusters-crop-sharpness-v4"}, read, validate_ocr)
+                        "end": b, "height": config.height,
+                        "sampling": "three-spread-clusters-crop-sharpness-v4"}, read, validate_ocr)
                     for j, detection in enumerate(data["detections"]):
                         f = data["frames"][detection["frame_index"]]
                         box = detection["bbox"]

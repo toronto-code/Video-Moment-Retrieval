@@ -41,7 +41,8 @@ def parser() -> argparse.ArgumentParser:
     idx.add_argument("--max-seconds", type=float)
     idx.add_argument("--skip-ocr", action="store_true")
     idx.add_argument("--ocr-every", type=float, default=10)
-    idx.add_argument("--height", type=int, default=720)
+    idx.add_argument("--height", type=int, default=720,
+                     help="Derived clip/frame height; capped at 720, never upscaled")
     idx.add_argument("--fps", type=int, default=8, help="Transport frame rate; provider may sample more sparsely")
     idx.add_argument("--no-rolling-context", action="store_true", help="Ablate previous-window state")
     idx.add_argument("--no-reconciliation", action="store_true", help="Ablate evidence-linked continuation pass")
